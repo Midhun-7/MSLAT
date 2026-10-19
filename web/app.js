@@ -16,6 +16,9 @@ $(window)
 .resize();
 
 $(function () {
+  // Default to Home view on load
+  $(".main-container").addClass("show");
+
   $(".discover").on("click", function (e) {
     $(".main-container").removeClass("show");
     $(".main-container").scrollTop(0);

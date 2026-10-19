@@ -71,9 +71,12 @@ def video_loop(feature_q, prediction_q, use_holistic):
                         LABELS[prediction], out[prediction]*100))
 
                 delay = 0
-                if feature_q.qsize() > 5:
-                    print(
-                        "Warning: Model feature queue overloaded - size = {}".format(feature_q.qsize()))
+                try:
+                    if feature_q.qsize() > 5:
+                        print(
+                            "Warning: Model feature queue overloaded - size = {}".format(feature_q.qsize()))
+                except (NotImplementedError, AttributeError):
+                    pass
                 print("--> ", end='')
                 for i, label in enumerate(out):
                     print("{}:{:.2f}% | ".format(LABELS[i], label*100), end='')
