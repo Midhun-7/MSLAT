@@ -1,3 +1,7 @@
+import os
+os.environ.setdefault('MPLCONFIGDIR', '/tmp/matplotlib')
+os.environ.setdefault('KERAS_HOME', '/tmp/keras')
+
 from sys import argv
 import cv2
 import mediapipe as mp
@@ -73,11 +77,13 @@ def video_loop(feature_q, prediction_q, use_holistic, label_q, img_q):
                     print("{} {}%".format(
                         LABELS[prediction], out[prediction]*100))
                     if LABELS[prediction] is not None:
-                        label_q.put(json.dumps({"label":LABELS[prediction]}))
-
+                        label_q.put(json.dumps({"label": LABELS[prediction]}))
+                    else:
+                        label_q.put(json.dumps({"label": None}))
                 else:
                     print("None ({} {}% Below threshold)".format(
                         LABELS[prediction], out[prediction]*100))
+                    label_q.put(json.dumps({"label": None}))
                 try:
                     if feature_q.qsize() > 300:
                         print("Warning: Model feature queue overloaded - size = {}".format(feature_q.qsize()))
@@ -204,7 +210,12 @@ def exit_handler(p):
         print("Couldn't kill video_loop")
 
 
-eel.init('web')
+# Use modern React + Tailwind frontend if built, otherwise fallback to web
+frontend_dist = Path(__file__).parent / 'frontend' / 'dist'
+if frontend_dist.exists():
+    eel.init(str(frontend_dist))
+else:
+    eel.init('web')
 
 # Usage: [model_path]
 if __name__ == "__main__":
