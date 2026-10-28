@@ -18,7 +18,6 @@ import {
   Delete,
   CornerDownLeft
 } from 'lucide-react';
-import { eelBridge } from '../services/eelService';
 import { dictionaryService } from '../services/dictionaryService';
 import { ml2en } from '../utils/ml2en';
 import { ALPHABET_SIGNS, INDEX_TO_CHAR_MAP, SignCharacter } from '../data/alphabet';
@@ -36,7 +35,12 @@ interface DetectedSign {
 export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
   const [activeTab, setActiveTab] = useState<'home' | 'learn'>('home');
   const [status, setStatus] = useState<'idle' | 'starting' | 'running' | 'stopping'>('idle');
-  const [cameraFrame, setCameraFrame] = useState<string | null>(null);
+
+  // Video and WebSocket streaming refs
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+  const streamTimerRef = useRef<any>(null);
 
   // Live real-time detected gesture from current frame
   const [liveSign, setLiveSign] = useState<DetectedSign | null>(null);
@@ -65,40 +69,125 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
-    // Listen to status updates from Eel
-    const unsubStatus = eelBridge.onStatus((newStatus) => {
-      setStatus(newStatus);
-      if (newStatus === 'idle') {
-        setCameraFrame(null);
-        setLiveSign(null);
-        setStreakCount(0);
-      }
-    });
-
-    // Listen to incoming base64 video frames from Python
-    const unsubImage = eelBridge.onImage((imgData) => {
-      setCameraFrame(imgData);
-    });
-
-    // Listen to incoming predicted gesture labels from Python
-    const unsubLabel = eelBridge.onLabel((labelStr) => {
-      handleDetectedLabel(labelStr);
-    });
-
     // Initialize the SQLite dictionary
     dictionaryService.init();
 
     return () => {
-      unsubStatus();
-      unsubImage();
-      unsubLabel();
+      stopCapture();
       if (inactivityTimerRef.current) {
         clearTimeout(inactivityTimerRef.current);
       }
     };
   }, []);
 
-  const handleDetectedLabel = (labelStr: string) => {
+  const sendFrame = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const ws = wsRef.current;
+
+    if (!video || !canvas || !ws || ws.readyState !== WebSocket.OPEN) return;
+    if (ws.bufferedAmount > 0) return; // Drop frame if network is congested
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(video, 0, 0, 640, 480);
+    canvas.toBlob(
+      (blob) => {
+        if (blob && ws.readyState === WebSocket.OPEN) {
+          ws.send(blob);
+        }
+      },
+      'image/jpeg',
+      0.6
+    );
+  };
+
+  const startCapture = async () => {
+    try {
+      setStatus('starting');
+
+      // 1. Request camera
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480 }
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+
+      // 2. Connect WebSocket to FastAPI backend
+      const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsHost = window.location.port === '5173' ? 'localhost:8000' : window.location.host;
+      const ws = new WebSocket(`${wsProtocol}//${wsHost}/ws`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setStatus('running');
+        // Stream at 10 FPS (every 100ms)
+        streamTimerRef.current = setInterval(sendFrame, 100);
+      };
+
+      ws.onmessage = (event) => {
+        handleDetectedLabel(event.data);
+      };
+
+      ws.onerror = (err) => {
+        console.error('WebSocket error:', err);
+      };
+
+      ws.onclose = () => {
+        stopCapture();
+      };
+    } catch (err) {
+      console.error('Error starting camera or WebSocket:', err);
+      stopCapture();
+    }
+  };
+
+  const stopCapture = () => {
+    if (streamTimerRef.current) {
+      clearInterval(streamTimerRef.current);
+      streamTimerRef.current = null;
+    }
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach((track) => track.stop());
+      videoRef.current.srcObject = null;
+    }
+    setStatus('idle');
+    setLiveSign(null);
+    setStreakCount(0);
+  };
+
+  const handleToggleCapture = () => {
+    if (status === 'running' || status === 'starting') {
+      stopCapture();
+    } else {
+      startCapture();
+    }
+  };
+
+  const handleDetectedLabel = (rawMsg: string) => {
+    // Ignore frame reception echoes from server
+    if (!rawMsg || rawMsg.startsWith('Frame received') || rawMsg.startsWith('Processed frame')) {
+      return;
+    }
+
+    let labelStr = rawMsg;
+    try {
+      const parsed = JSON.parse(rawMsg);
+      if (parsed && parsed.label !== undefined) {
+        labelStr = parsed.label === null ? '' : String(parsed.label);
+      }
+    } catch {
+      // rawMsg is plain string
+    }
+
     // Inactivity timeout: If no sign is received for 450ms (hand lowered), reset streak & allow re-typing
     if (inactivityTimerRef.current) {
       clearTimeout(inactivityTimerRef.current);
@@ -177,14 +266,6 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
           }
         }
       }
-    }
-  };
-
-  const handleToggleCapture = () => {
-    if (status === 'running') {
-      eelBridge.stop();
-    } else if (status === 'idle') {
-      eelBridge.start();
     }
   };
 
@@ -418,12 +499,29 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
 
                   {/* Video Viewport Container */}
                   <div className="relative w-full aspect-[4/3] bg-[#191823] rounded-2xl overflow-hidden flex items-center justify-center border border-white/5 shadow-inner">
-                    <img
-                      id="wimg"
-                      src={cameraFrame || 'https://media4.giphy.com/media/xTkcEQACH24SMPxIQg/giphy.gif'}
-                      alt="Camera Feed"
-                      className="w-full h-full object-cover"
+                    {/* Native HTML5 Webcam Video */}
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      playsInline
+                      muted
+                      className={`w-full h-full object-cover transform -scale-x-100 ${
+                        status === 'running' ? 'block' : 'hidden'
+                      }`}
                     />
+
+                    {/* Standby GIF Animation when camera is off */}
+                    {status !== 'running' && (
+                      <img
+                        id="wimg"
+                        src="https://media4.giphy.com/media/xTkcEQACH24SMPxIQg/giphy.gif"
+                        alt="Camera Standby"
+                        className="w-full h-full object-cover"
+                      />
+                    )}
+
+                    {/* Hidden canvas used to extract JPEG frames */}
+                    <canvas ref={canvasRef} width={640} height={480} className="hidden" />
 
                     {/* Prominent Live Letter Badge Overlay on Video (Only when camera is actively running) */}
                     {liveSign && status === 'running' && (
