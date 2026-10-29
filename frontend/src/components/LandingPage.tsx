@@ -198,7 +198,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({ onExplore }) => {
               Explore !
             </button>
             <a
-              href="https://google.github.io/mediapipe/solutions/hands.html"
+              href="https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker"
               target="_blank"
               rel="noopener noreferrer"
               className="px-6 py-3 rounded-full border border-white/30 text-white hover:bg-white/10 text-sm font-semibold transition-all inline-flex items-center"

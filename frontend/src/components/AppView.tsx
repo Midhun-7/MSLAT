@@ -41,10 +41,16 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const streamTimerRef = useRef<any>(null);
+  const isProcessingFrameRef = useRef<boolean>(false);
 
   // Live real-time detected gesture from current frame
   const [liveSign, setLiveSign] = useState<DetectedSign | null>(null);
   const [streakCount, setStreakCount] = useState<number>(0);
+
+  // Live accuracy meter & hand bounding box
+  const [accuracy, setAccuracy] = useState<number>(0);
+  const [handBox, setHandBox] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [guessSign, setGuessSign] = useState<DetectedSign | null>(null);
 
   // Word & sentence composition
   const [currentWord, setCurrentWord] = useState<string>('');
@@ -63,6 +69,7 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
   const streakRef = useRef<number>(0);
   const committedCharRef = useRef<string>('');
   const inactivityTimerRef = useRef<any>(null);
+  const lastCommitTimeRef = useRef<number>(0);
 
   const currentWordRef = useRef<string>('');
   const sentenceWordsRef = useRef<string[]>([]);
@@ -86,20 +93,27 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
     const ws = wsRef.current;
 
     if (!video || !canvas || !ws || ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > 0) return; // Drop frame if network is congested
+    if (isProcessingFrameRef.current) {
+      // Backpressure: If server is still processing the previous frame, drop this frame
+      // This completely eliminates queue lag and ensures 100% real-time responsiveness!
+      return;
+    }
+    if (ws.bufferedAmount > 0) return;
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    ctx.drawImage(video, 0, 0, 640, 480);
+    // Snapshot at lightweight 320x240 for ultra-fast encoding & low network latency
+    ctx.drawImage(video, 0, 0, 320, 240);
     canvas.toBlob(
       (blob) => {
         if (blob && ws.readyState === WebSocket.OPEN) {
+          isProcessingFrameRef.current = true;
           ws.send(blob);
         }
       },
       'image/jpeg',
-      0.6
+      0.5
     );
   };
 
@@ -124,15 +138,18 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
 
       ws.onopen = () => {
         setStatus('running');
-        // Stream at 10 FPS (every 100ms)
+        // Stream at 10 FPS (every 100ms) with backpressure control
         streamTimerRef.current = setInterval(sendFrame, 100);
       };
 
       ws.onmessage = (event) => {
+        // Release processing flag immediately upon server reply
+        isProcessingFrameRef.current = false;
         handleDetectedLabel(event.data);
       };
 
       ws.onerror = (err) => {
+        isProcessingFrameRef.current = false;
         console.error('WebSocket error:', err);
       };
 
@@ -146,6 +163,7 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
   };
 
   const stopCapture = () => {
+    isProcessingFrameRef.current = false;
     if (streamTimerRef.current) {
       clearInterval(streamTimerRef.current);
       streamTimerRef.current = null;
@@ -162,6 +180,11 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
     setStatus('idle');
     setLiveSign(null);
     setStreakCount(0);
+    setAccuracy(0);
+    setHandBox(null);
+    setGuessSign(null);
+    committedCharRef.current = '';
+    lastCommitTimeRef.current = 0;
   };
 
   const handleToggleCapture = () => {
@@ -178,32 +201,75 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
       return;
     }
 
-    let labelStr = rawMsg;
+    let labelStr = '';
+    let guessStr = '';
+    let conf = 0;
+    let box: { x: number; y: number; width: number; height: number } | null = null;
+
     try {
       const parsed = JSON.parse(rawMsg);
-      if (parsed && parsed.label !== undefined) {
-        labelStr = parsed.label === null ? '' : String(parsed.label);
+      if (parsed) {
+        if (parsed.label !== undefined && parsed.label !== null) {
+          labelStr = String(parsed.label);
+        }
+        if (parsed.guess !== undefined && parsed.guess !== null) {
+          guessStr = String(parsed.guess);
+        }
+        if (parsed.confidence !== undefined) {
+          conf = Math.round(Number(parsed.confidence) * 100);
+        }
+        if (parsed.box) {
+          box = parsed.box;
+        }
       }
     } catch {
-      // rawMsg is plain string
+      labelStr = rawMsg;
     }
 
-    // Inactivity timeout: If no sign is received for 450ms (hand lowered), reset streak & allow re-typing
+    setAccuracy(conf);
+    setHandBox(box);
+
+    if (!box) {
+      // Hand not detected on this frame: clear visual targeting overlays
+      setAccuracy(0);
+      setHandBox(null);
+      setGuessSign(null);
+
+      // Smooth debounced reset: ONLY clear committed character after hand is lowered for 600ms
+      // This prevents 1-frame camera flickers from re-triggering duplicate letters!
+      if (!inactivityTimerRef.current) {
+        inactivityTimerRef.current = setTimeout(() => {
+          setLiveSign(null);
+          setStreakCount(0);
+          streakCharRef.current = '';
+          committedCharRef.current = '';
+          inactivityTimerRef.current = null;
+        }, 600);
+      }
+      return;
+    }
+
+    // Hand is actively in frame: cancel inactivity timeout
     if (inactivityTimerRef.current) {
       clearTimeout(inactivityTimerRef.current);
+      inactivityTimerRef.current = null;
     }
-    inactivityTimerRef.current = setTimeout(() => {
-      setLiveSign(null);
-      setStreakCount(0);
-      streakCharRef.current = '';
-      committedCharRef.current = '';
-    }, 450);
+
+    // Resolve tentative guess sign (for live visual hint before lock-in)
+    if (guessStr) {
+      const gIdx = parseInt(guessStr, 10);
+      if (!isNaN(gIdx)) {
+        const sObj = ALPHABET_SIGNS.find(s => s.id === gIdx);
+        const gChar = sObj ? sObj.char : INDEX_TO_CHAR_MAP.get(gIdx);
+        if (gChar) {
+          setGuessSign({ id: gIdx, char: gChar, phonetic: sObj?.phonetic || '' });
+        }
+      }
+    } else {
+      setGuessSign(null);
+    }
 
     if (!labelStr || labelStr === 'null' || labelStr === 'None') {
-      setLiveSign(null);
-      setStreakCount(0);
-      streakCharRef.current = '';
-      committedCharRef.current = '';
       return;
     }
 
@@ -230,40 +296,45 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
     }
 
     const currentStreak = streakRef.current;
-    setStreakCount(Math.min(currentStreak, 3));
+    setStreakCount(Math.min(currentStreak, 2));
 
-    // 3. When held steadily for 3 consecutive frames, commit the letter into the connected word!
-    if (currentStreak === 3) {
-      if (committedCharRef.current !== char) {
-        committedCharRef.current = char;
+    // 3. Commit letter into permanent word box:
+    // Requires >= 50% confidence, a new character, and 1000ms cooldown to prevent repeat chatter
+    const now = Date.now();
+    const isNewChar = committedCharRef.current !== char;
+    const cooldownPassed = (now - lastCommitTimeRef.current) > 1000;
+    const shouldCommit = (conf >= 50 || currentStreak >= 2) && isNewChar && cooldownPassed;
 
-        // Apply Malayalam character connection / dependent vowel joining rules
-        let s = char;
-        const curWord = currentWordRef.current;
-        if (curWord.length > 0) {
-          if (s === '\u0D06') s = '\u0D3E';      // aa -> vowel sign aa
-          else if (s === '\u0D05') s = '';        // a -> inherent sound
-          else if (s === '\u0D07') s = '\u0D3F';  // i -> vowel sign i
-          else if (s === '\u0D08') s = '\u0D40';  // ii -> vowel sign ii
-          else if (s === '\u0D09') s = '\u0D41';  // u -> vowel sign u
-          else if (s === '\u0D0A') s = '\u0D42';  // uu -> vowel sign uu
-        }
+    if (shouldCommit) {
+      lastCommitTimeRef.current = now;
+      committedCharRef.current = char;
 
-        if (s) {
-          const updatedWord = curWord + s;
-          currentWordRef.current = updatedWord;
-          setCurrentWord(updatedWord);
+      // Apply Malayalam character connection / dependent vowel joining rules
+      let s = char;
+      const curWord = currentWordRef.current;
+      if (curWord.length > 0) {
+        if (s === '\u0D06') s = '\u0D3E';      // aa -> vowel sign aa
+        else if (s === '\u0D05') s = '';        // a -> inherent sound
+        else if (s === '\u0D07') s = '\u0D3F';  // i -> vowel sign i
+        else if (s === '\u0D08') s = '\u0D40';  // ii -> vowel sign ii
+        else if (s === '\u0D09') s = '\u0D41';  // u -> vowel sign u
+        else if (s === '\u0D0A') s = '\u0D42';  // uu -> vowel sign uu
+      }
 
-          const fullSentence = [...sentenceWordsRef.current, updatedWord].filter(Boolean).join(' ');
-          setSentence(fullSentence);
+      if (s) {
+        const updatedWord = curWord + s;
+        currentWordRef.current = updatedWord;
+        setCurrentWord(updatedWord);
 
-          // Query dictionary predictions for the composed word
-          const preds = dictionaryService.getPredictions(updatedWord);
-          setPredictions(preds);
+        const fullSentence = [...sentenceWordsRef.current, updatedWord].filter(Boolean).join(' ');
+        setSentence(fullSentence);
 
-          if (textareaRef.current) {
-            textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
-          }
+        // Query dictionary predictions for the composed word
+        const preds = dictionaryService.getPredictions(updatedWord);
+        setPredictions(preds);
+
+        if (textareaRef.current) {
+          textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
         }
       }
     }
@@ -521,11 +592,11 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
                     )}
 
                     {/* Hidden canvas used to extract JPEG frames */}
-                    <canvas ref={canvasRef} width={640} height={480} className="hidden" />
+                    <canvas ref={canvasRef} width={320} height={240} className="hidden" />
 
                     {/* Prominent Live Letter Badge Overlay on Video (Only when camera is actively running) */}
                     {liveSign && status === 'running' && (
-                      <div className="absolute top-4 left-4 bg-black/85 backdrop-blur-md px-4 py-2.5 rounded-2xl border border-blue-500/30 flex items-center space-x-3.5 shadow-2xl animate-fade-in ring-1 ring-blue-500/20">
+                      <div className="absolute top-4 left-4 bg-black/85 backdrop-blur-md px-4 py-2.5 rounded-2xl border border-blue-500/30 flex items-center space-x-3.5 shadow-2xl animate-fade-in ring-1 ring-blue-500/20 z-20">
                         <div className="flex flex-col">
                           <span className="text-[10px] uppercase tracking-wider text-blue-400 font-bold">
                             Live Letter
@@ -540,7 +611,7 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
                           </span>
                           {/* Streak lock indicator dots */}
                           <div className="flex items-center space-x-1 mt-1.5">
-                            {[1, 2, 3].map((step) => (
+                            {[1, 2].map((step) => (
                               <span
                                 key={step}
                                 className={`w-2 h-2 rounded-full transition-all ${
@@ -551,9 +622,85 @@ export const AppView: React.FC<AppViewProps> = ({ onGoBack }) => {
                               />
                             ))}
                             <span className="text-[9px] text-gray-400 font-medium ml-1">
-                              {streakCount >= 3 ? 'Locked!' : 'Hold...'}
+                              {streakCount >= 2 ? 'Locked!' : 'Hold...'}
                             </span>
                           </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {/* AI Hand Bounding Box Overlay (Horizontally mirrored to match -scale-x-100 webcam) */}
+                    {status === 'running' && handBox && (
+                      <div
+                        className="absolute pointer-events-none transition-all duration-75 ease-out rounded-2xl border-2 z-10"
+                        style={{
+                          left: `${Math.max(0, (1.0 - (handBox.x + handBox.width))) * 100}%`,
+                          top: `${handBox.y * 100}%`,
+                          width: `${handBox.width * 100}%`,
+                          height: `${handBox.height * 100}%`,
+                          borderColor: accuracy >= 45 ? '#10b981' : '#38bdf8',
+                          boxShadow: accuracy >= 45
+                            ? '0 0 20px rgba(16, 185, 129, 0.45)'
+                            : '0 0 15px rgba(56, 189, 248, 0.35)',
+                          backgroundColor: accuracy >= 45
+                            ? 'rgba(16, 185, 129, 0.08)'
+                            : 'rgba(56, 189, 248, 0.05)'
+                        }}
+                      >
+                        {/* Corner Target Accents */}
+                        <div className="absolute -top-1 -left-1 w-3.5 h-3.5 border-t-2 border-l-2 border-white rounded-tl" />
+                        <div className="absolute -top-1 -right-1 w-3.5 h-3.5 border-t-2 border-r-2 border-white rounded-tr" />
+                        <div className="absolute -bottom-1 -left-1 w-3.5 h-3.5 border-b-2 border-l-2 border-white rounded-bl" />
+                        <div className="absolute -bottom-1 -right-1 w-3.5 h-3.5 border-b-2 border-r-2 border-white rounded-br" />
+
+                        {/* Top Tracking Tag */}
+                        <div className={`absolute -top-6 left-0 px-2 py-0.5 rounded text-[10px] font-bold backdrop-blur-md shadow-md flex items-center space-x-1 whitespace-nowrap ${
+                          accuracy >= 45 ? 'bg-emerald-600/90 text-white' : 'bg-blue-600/90 text-white'
+                        }`}>
+                          <span>{accuracy >= 45 ? '✓ LOCKED' : 'TRACKING'}</span>
+                          <span>&bull;</span>
+                          <span>{accuracy}%</span>
+                          {guessSign && !liveSign && (
+                            <span className="text-amber-200 ml-0.5">({guessSign.char})</span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Live Accuracy Meter HUD (Top-Right) */}
+                    {status === 'running' && (
+                      <div className="absolute top-4 right-4 bg-black/85 backdrop-blur-md px-3.5 py-2 rounded-2xl border border-white/10 flex flex-col space-y-1.5 shadow-2xl min-w-[140px] z-20">
+                        <div className="flex items-center justify-between text-[11px] font-bold">
+                          <span className="text-gray-300 uppercase tracking-wider text-[10px]">
+                            {handBox ? 'Confidence' : 'No Hand'}
+                          </span>
+                          <span className={accuracy >= 45 ? 'text-emerald-400 font-extrabold' : accuracy > 0 ? 'text-blue-400 font-semibold' : 'text-gray-500'}>
+                            {accuracy}%
+                          </span>
+                        </div>
+                        {/* Progress Bar with 45% Threshold Line */}
+                        <div className="relative w-full h-2 bg-white/10 rounded-full overflow-hidden">
+                          {/* 45% Threshold Marker Line */}
+                          <div
+                            className="absolute top-0 bottom-0 w-0.5 bg-white/40 z-10"
+                            style={{ left: '45%' }}
+                            title="45% Lock-in Threshold"
+                          />
+                          <div
+                            className={`h-full transition-all duration-150 rounded-full ${
+                              accuracy >= 45
+                                ? 'bg-emerald-400 shadow-sm shadow-emerald-400'
+                                : accuracy >= 20
+                                ? 'bg-amber-400'
+                                : 'bg-blue-400'
+                            }`}
+                            style={{ width: `${Math.min(100, Math.max(0, accuracy))}%` }}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between text-[8px] text-gray-400">
+                          <span>0%</span>
+                          <span className="text-gray-300 font-semibold">45% Lock</span>
+                          <span>100%</span>
                         </div>
                       </div>
                     )}

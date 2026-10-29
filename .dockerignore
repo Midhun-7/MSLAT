@@ -1,0 +1,12 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+frontend/node_modules/
+frontend/src/
+videos/
+output/
+*.png
+.DS_Store
